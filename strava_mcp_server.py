@@ -5,6 +5,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -122,15 +123,44 @@ def meters_to_feet(meters: float) -> float:
 
 
 class SimpleOAuthProvider:
-    """In-memory OAuth 2.0 provider for single-user MCP server."""
+    """OAuth 2.0 provider for single-user MCP server.
+
+    Uses HMAC-signed tokens so access/refresh tokens survive server restarts.
+    Only auth codes and pending sessions are in-memory (short-lived).
+    """
 
     def __init__(self, password: str):
         self.password = password
+        self.signing_key = password
         self.clients: Dict[str, Dict[str, Any]] = {}
         self.auth_codes: Dict[str, Dict[str, Any]] = {}
-        self.access_tokens: Dict[str, Dict[str, Any]] = {}
-        self.refresh_tokens: Dict[str, Dict[str, Any]] = {}
         self.pending_auth: Dict[str, Dict[str, Any]] = {}
+
+    def _sign_token(self, payload: Dict[str, Any]) -> str:
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode().rstrip("=")
+        sig = hmac.new(
+            self.signing_key.encode(), payload_b64.encode(), hashlib.sha256
+        ).hexdigest()
+        return f"{payload_b64}.{sig}"
+
+    def _verify_token(self, token: str) -> Optional[Dict[str, Any]]:
+        try:
+            payload_b64, sig = token.rsplit(".", 1)
+            expected_sig = hmac.new(
+                self.signing_key.encode(), payload_b64.encode(), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig, expected_sig):
+                return None
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            if payload.get("exp", 0) < time.time():
+                return None
+            return payload
+        except Exception:
+            return None
 
     def register_client(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         client_id = secrets.token_urlsafe(16)
@@ -196,39 +226,39 @@ class SimpleOAuthProvider:
         return self._issue_tokens(client_id, auth_code["scopes"]), None
 
     def refresh(self, refresh_token_str: str, client_id: str) -> tuple:
-        rt = self.refresh_tokens.pop(refresh_token_str, None)
-        if not rt:
+        payload = self._verify_token(refresh_token_str)
+        if not payload:
             return None, "invalid_grant"
-        if rt["client_id"] != client_id:
+        if payload.get("type") != "refresh":
             return None, "invalid_grant"
-        return self._issue_tokens(client_id, rt["scopes"]), None
+        return self._issue_tokens(client_id, payload.get("scopes", [])), None
 
     def validate_token(self, token: str) -> Optional[Dict[str, Any]]:
-        at = self.access_tokens.get(token)
-        if not at:
+        payload = self._verify_token(token)
+        if not payload:
             return None
-        if at["expires_at"] < time.time():
-            self.access_tokens.pop(token, None)
+        if payload.get("type") != "access":
             return None
-        return at
+        return payload
 
     def _issue_tokens(self, client_id: str, scopes: List[str]) -> Dict[str, Any]:
-        access_token = secrets.token_urlsafe(32)
-        refresh_token = secrets.token_urlsafe(32)
-        self.access_tokens[access_token] = {
+        access_payload = {
+            "type": "access",
             "client_id": client_id,
             "scopes": scopes,
-            "expires_at": time.time() + 86400,
+            "exp": int(time.time()) + 86400,
         }
-        self.refresh_tokens[refresh_token] = {
+        refresh_payload = {
+            "type": "refresh",
             "client_id": client_id,
             "scopes": scopes,
+            "exp": int(time.time()) + 86400 * 30,
         }
         result: Dict[str, Any] = {
-            "access_token": access_token,
+            "access_token": self._sign_token(access_payload),
             "token_type": "bearer",
             "expires_in": 86400,
-            "refresh_token": refresh_token,
+            "refresh_token": self._sign_token(refresh_payload),
         }
         if scopes:
             result["scope"] = " ".join(scopes)
@@ -750,8 +780,6 @@ def create_http_app() -> Starlette:
         form = await request.form()
         grant_type = form.get("grant_type")
         client_id = str(form.get("client_id", ""))
-        if client_id not in oauth.clients:
-            return JSONResponse({"error": "invalid_client"}, status_code=401)
         if grant_type == "authorization_code":
             tokens, error = oauth.exchange_code(
                 code=str(form.get("code", "")),
