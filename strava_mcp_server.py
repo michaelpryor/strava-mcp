@@ -692,6 +692,11 @@ def create_http_app() -> Starlette:
         })
 
     async def handle_register(request: Request) -> Response:
+        if request.method == "GET":
+            return JSONResponse({
+                "registration_endpoint": f"{str(request.base_url).rstrip('/')}/register",
+                "registration_endpoint_auth_methods_supported": [],
+            })
         body = await request.json()
         client = oauth.register_client(body)
         return JSONResponse(client, status_code=201)
@@ -768,19 +773,21 @@ def create_http_app() -> Starlette:
         return JSONResponse(tokens)
 
     async def handle_mcp(request: Request) -> Response:
+        server_url = str(request.base_url).rstrip("/")
+        www_auth = f'Bearer resource_metadata="{server_url}/.well-known/oauth-protected-resource"'
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
             return JSONResponse(
                 {"error": "Missing bearer token"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": www_auth},
             )
         token = auth_header[len("Bearer "):]
         if not oauth.validate_token(token):
             return JSONResponse(
                 {"error": "Invalid or expired token"},
                 status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": www_auth},
             )
         await session_manager.handle_request(
             request.scope, request.receive, request._send
@@ -807,7 +814,7 @@ def create_http_app() -> Starlette:
                 endpoint=handle_protected_resource_metadata,
                 methods=["GET"],
             ),
-            Route("/register", endpoint=handle_register, methods=["POST"]),
+            Route("/register", endpoint=handle_register, methods=["GET", "POST"]),
             Route("/authorize", endpoint=handle_authorize, methods=["GET"]),
             Route("/login", endpoint=handle_login, methods=["GET", "POST"]),
             Route("/token", endpoint=handle_token, methods=["POST"]),
@@ -860,7 +867,13 @@ def main():
 
     if args.transport == "http":
         http_app = create_http_app()
-        uvicorn.run(http_app, host=args.host, port=args.port, proxy_headers=True)
+        uvicorn.run(
+            http_app,
+            host=args.host,
+            port=args.port,
+            proxy_headers=True,
+            forwarded_allow_ips="*",
+        )
     else:
         asyncio.run(run_stdio())
 
