@@ -69,7 +69,7 @@ class StravaAPI:
 
         all_activities: List[Dict[str, Any]] = []
         page = 1
-        page_size = min(per_page, 200)
+        page_size = 200  # Always fetch max per API call; per_page is the total cap
 
         async with httpx.AsyncClient() as client:
             while True:
