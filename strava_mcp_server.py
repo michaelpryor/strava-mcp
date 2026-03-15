@@ -63,17 +63,16 @@ class StravaAPI:
         ):
             await self.refresh_access_token()
 
-    async def get_activities(self, before: Optional[int] = None, after: Optional[int] = None, per_page: int = 30) -> List[Dict[str, Any]]:
-        """Get athlete activities, paginating through all results."""
+    async def get_activities(self, before: Optional[int] = None, after: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get all athlete activities in the time window, paginating through all pages."""
         await self.ensure_valid_token()
 
         all_activities: List[Dict[str, Any]] = []
         page = 1
-        page_size = 200  # Always fetch max per API call; per_page is the total cap
 
         async with httpx.AsyncClient() as client:
             while True:
-                params: Dict[str, Any] = {"per_page": page_size, "page": page}
+                params: Dict[str, Any] = {"per_page": 200, "page": page}
                 if before:
                     params["before"] = before
                 if after:
@@ -92,13 +91,7 @@ class StravaAPI:
 
                 all_activities.extend(batch)
 
-                # If caller specified a limit via per_page, stop once we have enough
-                if len(all_activities) >= per_page:
-                    all_activities = all_activities[:per_page]
-                    break
-
-                # Partial page means no more results
-                if len(batch) < page_size:
+                if len(batch) < 200:
                     break
 
                 page += 1
@@ -332,11 +325,6 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Number of days back to fetch activities (default: 30)",
                         "default": 30
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
-                        "default": 30
                     }
                 }
             }
@@ -351,11 +339,6 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Number of weeks to analyze (default: 4)",
                         "default": 4
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
-                        "default": 30
                     }
                 }
             }
@@ -369,11 +352,6 @@ async def handle_list_tools() -> List[Tool]:
                     "days": {
                         "type": "integer",
                         "description": "Number of days back to analyze (default: 30)",
-                        "default": 30
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
                         "default": 30
                     }
                 }
@@ -389,11 +367,6 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Number of days back to fetch rides (default: 30)",
                         "default": 30
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
-                        "default": 30
                     }
                 }
             }
@@ -408,11 +381,6 @@ async def handle_list_tools() -> List[Tool]:
                         "type": "integer",
                         "description": "Number of weeks to analyze (default: 4)",
                         "default": 4
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
-                        "default": 30
                     }
                 }
             }
@@ -426,11 +394,6 @@ async def handle_list_tools() -> List[Tool]:
                     "days": {
                         "type": "integer",
                         "description": "Number of days back to analyze (default: 30)",
-                        "default": 30
-                    },
-                    "per_page": {
-                        "type": "integer",
-                        "description": "Max number of activities to fetch from Strava (default: 30, max: 200)",
                         "default": 30
                     }
                 }
@@ -448,10 +411,10 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
     try:
         if name == "get_recent_runs":
             days = arguments.get("days", 30)
-            per_page = arguments.get("per_page", 30)
+
             after_timestamp = int((datetime.now() - timedelta(days=days)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             
             # Filter for running activities
             runs = [activity for activity in activities if activity["type"] == "Run"]
@@ -475,11 +438,11 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
         elif name == "get_weekly_mileage":
             weeks = arguments.get("weeks", 4)
-            per_page = arguments.get("per_page", 30)
+
             days_back = weeks * 7
             after_timestamp = int((datetime.now() - timedelta(days=days_back)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             runs = [activity for activity in activities if activity["type"] == "Run"]
             
             # Group runs by week
@@ -511,10 +474,10 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
         elif name == "analyze_pace_trends":
             days = arguments.get("days", 30)
-            per_page = arguments.get("per_page", 30)
+
             after_timestamp = int((datetime.now() - timedelta(days=days)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             runs = [activity for activity in activities if activity["type"] == "Run" and activity["average_speed"]]
             
             if not runs:
@@ -554,10 +517,10 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
         elif name == "get_recent_rides":
             days = arguments.get("days", 30)
-            per_page = arguments.get("per_page", 30)
+
             after_timestamp = int((datetime.now() - timedelta(days=days)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             rides = [a for a in activities if a["type"] == "Ride"]
 
             if not rides:
@@ -608,11 +571,11 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
         elif name == "get_weekly_ride_stats":
             weeks = arguments.get("weeks", 4)
-            per_page = arguments.get("per_page", 30)
+
             days_back = weeks * 7
             after_timestamp = int((datetime.now() - timedelta(days=days_back)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             rides = [a for a in activities if a["type"] == "Ride"]
 
             weekly_stats: Dict[str, Dict[str, float]] = {}
@@ -653,10 +616,10 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
         elif name == "analyze_ride_trends":
             days = arguments.get("days", 30)
-            per_page = arguments.get("per_page", 30)
+
             after_timestamp = int((datetime.now() - timedelta(days=days)).timestamp())
 
-            activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
+            activities = await strava_api.get_activities(after=after_timestamp)
             rides = [a for a in activities if a["type"] == "Ride"]
 
             if not rides:
