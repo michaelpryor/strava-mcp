@@ -25,7 +25,7 @@ from pydantic import AnyUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 
 class StravaAPI:
@@ -872,27 +872,29 @@ def create_http_app() -> Starlette:
             return JSONResponse({"error": error}, status_code=400)
         return JSONResponse(tokens)
 
-    async def handle_mcp(request: Request) -> Response:
+    async def handle_mcp(scope, receive, send):
+        request = Request(scope, receive, send)
         server_url = str(request.base_url).rstrip("/")
         www_auth = f'Bearer resource_metadata="{server_url}/.well-known/oauth-protected-resource"'
         auth_header = request.headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
-            return JSONResponse(
+            response = JSONResponse(
                 {"error": "Missing bearer token"},
                 status_code=401,
                 headers={"WWW-Authenticate": www_auth},
             )
+            await response(scope, receive, send)
+            return
         token = auth_header[len("Bearer "):]
         if not oauth.validate_token(token):
-            return JSONResponse(
+            response = JSONResponse(
                 {"error": "Invalid or expired token"},
                 status_code=401,
                 headers={"WWW-Authenticate": www_auth},
             )
-        await session_manager.handle_request(
-            request.scope, request.receive, request._send
-        )
-        return Response()
+            await response(scope, receive, send)
+            return
+        await session_manager.handle_request(scope, receive, send)
 
     async def handle_health(request: Request) -> Response:
         return JSONResponse({"status": "ok", "server": "strava-coach"})
@@ -918,7 +920,7 @@ def create_http_app() -> Starlette:
             Route("/authorize", endpoint=handle_authorize, methods=["GET"]),
             Route("/login", endpoint=handle_login, methods=["GET", "POST"]),
             Route("/token", endpoint=handle_token, methods=["POST"]),
-            Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
+            Mount("/mcp", app=handle_mcp),
             Route("/health", endpoint=handle_health, methods=["GET"]),
         ],
         lifespan=lifespan,
