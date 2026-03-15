@@ -64,23 +64,46 @@ class StravaAPI:
             await self.refresh_access_token()
 
     async def get_activities(self, before: Optional[int] = None, after: Optional[int] = None, per_page: int = 30) -> List[Dict[str, Any]]:
-        """Get athlete activities"""
+        """Get athlete activities, paginating through all results."""
         await self.ensure_valid_token()
-        
-        params = {"per_page": per_page}
-        if before:
-            params["before"] = before
-        if after:
-            params["after"] = after
+
+        all_activities: List[Dict[str, Any]] = []
+        page = 1
+        page_size = min(per_page, 200)
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                "https://www.strava.com/api/v3/athlete/activities",
-                headers={"Authorization": f"Bearer {self.access_token}"},
-                params=params
-            )
-            response.raise_for_status()
-            return response.json()
+            while True:
+                params: Dict[str, Any] = {"per_page": page_size, "page": page}
+                if before:
+                    params["before"] = before
+                if after:
+                    params["after"] = after
+
+                response = await client.get(
+                    "https://www.strava.com/api/v3/athlete/activities",
+                    headers={"Authorization": f"Bearer {self.access_token}"},
+                    params=params
+                )
+                response.raise_for_status()
+                batch = response.json()
+
+                if not batch:
+                    break
+
+                all_activities.extend(batch)
+
+                # If caller specified a limit via per_page, stop once we have enough
+                if len(all_activities) >= per_page:
+                    all_activities = all_activities[:per_page]
+                    break
+
+                # Partial page means no more results
+                if len(batch) < page_size:
+                    break
+
+                page += 1
+
+        return all_activities
 
     async def get_athlete(self) -> Dict[str, Any]:
         """Get athlete information"""
@@ -547,21 +570,38 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 distance_miles = meters_to_miles(ride["distance"])
                 avg_speed_mph = meters_per_second_to_mph(ride["average_speed"]) if ride.get("average_speed") else None
                 elevation_ft = meters_to_feet(ride.get("total_elevation_gain", 0))
-                duration_minutes = ride["elapsed_time"] // 60
-                duration_seconds = ride["elapsed_time"] % 60
+                moving_minutes = ride.get("moving_time", ride["elapsed_time"]) // 60
+                moving_seconds = ride.get("moving_time", ride["elapsed_time"]) % 60
+                elapsed_minutes = ride["elapsed_time"] // 60
+                elapsed_seconds = ride["elapsed_time"] % 60
+                is_indoor = ride.get("trainer", False)
 
-                result += f"• {date.strftime('%Y-%m-%d')}: {ride['name']}\n"
-                result += f"  Distance: {distance_miles:.2f} miles\n"
-                if avg_speed_mph is not None:
+                result += f"• {date.strftime('%Y-%m-%d')}: {ride['name']}"
+                if is_indoor:
+                    result += " (indoor/trainer)"
+                result += "\n"
+                if distance_miles > 0:
+                    result += f"  Distance: {distance_miles:.2f} miles\n"
+                if avg_speed_mph and avg_speed_mph > 0:
                     result += f"  Avg Speed: {avg_speed_mph:.1f} mph\n"
-                result += f"  Elevation: {elevation_ft:.0f} ft\n"
-                result += f"  Duration: {duration_minutes}:{duration_seconds:02d}\n"
+                if ride.get("max_speed") and ride["max_speed"] > 0:
+                    result += f"  Max Speed: {meters_per_second_to_mph(ride['max_speed']):.1f} mph\n"
+                if elevation_ft > 0:
+                    result += f"  Elevation: {elevation_ft:.0f} ft\n"
+                result += f"  Moving Time: {moving_minutes}:{moving_seconds:02d}\n"
+                if moving_minutes != elapsed_minutes or moving_seconds != elapsed_seconds:
+                    result += f"  Elapsed Time: {elapsed_minutes}:{elapsed_seconds:02d}\n"
                 if ride.get("average_watts"):
                     result += f"  Avg Power: {ride['average_watts']:.0f}W\n"
                 if ride.get("weighted_average_watts"):
                     result += f"  Normalized Power: {ride['weighted_average_watts']}W\n"
                 if ride.get("kilojoules"):
                     result += f"  Energy: {ride['kilojoules']:.0f} kJ\n"
+                if ride.get("has_heartrate"):
+                    result += f"  Avg Heart Rate: {ride['average_heartrate']:.0f} bpm\n"
+                    result += f"  Max Heart Rate: {ride['max_heartrate']:.0f} bpm\n"
+                if ride.get("suffer_score"):
+                    result += f"  Relative Effort: {ride['suffer_score']:.0f}\n"
                 result += "\n"
 
             return [TextContent(type="text", text=result)]
@@ -617,10 +657,10 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
             after_timestamp = int((datetime.now() - timedelta(days=days)).timestamp())
 
             activities = await strava_api.get_activities(after=after_timestamp, per_page=per_page)
-            rides = [a for a in activities if a["type"] == "Ride" and a.get("average_speed")]
+            rides = [a for a in activities if a["type"] == "Ride"]
 
             if not rides:
-                return [TextContent(type="text", text="No cycling activities with speed data found.")]
+                return [TextContent(type="text", text="No cycling activities found.")]
 
             rides.sort(key=lambda x: x["start_date_local"])
 
@@ -628,41 +668,73 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
 
             speeds = []
             powers = []
+            heart_rates = []
+            efforts = []
             for ride in rides:
-                speed_mph = meters_per_second_to_mph(ride["average_speed"])
-                speeds.append(speed_mph)
-
                 date = datetime.fromisoformat(ride["start_date_local"].replace("Z", "+00:00"))
-                distance_miles = meters_to_miles(ride["distance"])
-                elevation_ft = meters_to_feet(ride.get("total_elevation_gain", 0))
+                moving_min = ride.get("moving_time", ride["elapsed_time"]) // 60
+                is_indoor = ride.get("trainer", False)
 
-                line = f"{date.strftime('%m/%d')}: {speed_mph:.1f} mph, {distance_miles:.1f} mi, {elevation_ft:.0f} ft"
+                line = f"{date.strftime('%m/%d')}: {moving_min}min"
+                if is_indoor:
+                    line += " (indoor)"
+
+                if ride.get("average_speed") and ride["average_speed"] > 0:
+                    speed_mph = meters_per_second_to_mph(ride["average_speed"])
+                    speeds.append(speed_mph)
+                    distance_miles = meters_to_miles(ride["distance"])
+                    line += f", {speed_mph:.1f} mph, {distance_miles:.1f} mi"
+
+                if ride.get("total_elevation_gain") and ride["total_elevation_gain"] > 0:
+                    line += f", {meters_to_feet(ride['total_elevation_gain']):.0f} ft"
+
                 if ride.get("average_watts"):
                     powers.append(ride["average_watts"])
                     line += f", {ride['average_watts']:.0f}W"
+
+                if ride.get("has_heartrate"):
+                    heart_rates.append(ride["average_heartrate"])
+                    line += f", {ride['average_heartrate']:.0f} bpm avg HR"
+
+                if ride.get("suffer_score"):
+                    efforts.append(ride["suffer_score"])
+                    line += f", effort {ride['suffer_score']:.0f}"
+
                 result += line + "\n"
 
-            avg_speed = sum(speeds) / len(speeds)
-            recent_speed_avg = sum(speeds[-3:]) / min(3, len(speeds))
-            early_speed_avg = sum(speeds[:3]) / min(3, len(speeds))
+            result += "\n--- Summary ---\n"
 
-            speed_trend = "improving" if recent_speed_avg > early_speed_avg else "declining"
-            if abs(recent_speed_avg - early_speed_avg) < 0.5:
-                speed_trend = "stable"
-
-            result += f"\nAvg speed: {avg_speed:.1f} mph\n"
-            result += f"Speed trend: {speed_trend}"
+            if speeds:
+                avg_speed = sum(speeds) / len(speeds)
+                result += f"Avg speed: {avg_speed:.1f} mph\n"
+                if len(speeds) >= 3:
+                    recent = sum(speeds[-3:]) / 3
+                    early = sum(speeds[:3]) / 3
+                    trend = "improving" if recent > early else ("stable" if abs(recent - early) < 0.5 else "declining")
+                    result += f"Speed trend: {trend}\n"
 
             if powers:
                 avg_power = sum(powers) / len(powers)
-                result += f"\nAvg power: {avg_power:.0f}W"
+                result += f"Avg power: {avg_power:.0f}W\n"
                 if len(powers) >= 3:
-                    recent_power_avg = sum(powers[-3:]) / min(3, len(powers))
-                    early_power_avg = sum(powers[:3]) / min(3, len(powers))
-                    power_trend = "improving" if recent_power_avg > early_power_avg else "declining"
-                    if abs(recent_power_avg - early_power_avg) < 5:
-                        power_trend = "stable"
-                    result += f"\nPower trend: {power_trend}"
+                    recent = sum(powers[-3:]) / 3
+                    early = sum(powers[:3]) / 3
+                    trend = "improving" if recent > early else ("stable" if abs(recent - early) < 5 else "declining")
+                    result += f"Power trend: {trend}\n"
+
+            if heart_rates:
+                avg_hr = sum(heart_rates) / len(heart_rates)
+                result += f"Avg heart rate: {avg_hr:.0f} bpm\n"
+                if len(heart_rates) >= 3:
+                    recent = sum(heart_rates[-3:]) / 3
+                    early = sum(heart_rates[:3]) / 3
+                    # Lower HR at same effort = improving fitness
+                    trend = "improving (lower HR)" if recent < early else ("stable" if abs(recent - early) < 3 else "higher HR")
+                    result += f"HR trend: {trend}\n"
+
+            if efforts:
+                avg_effort = sum(efforts) / len(efforts)
+                result += f"Avg relative effort: {avg_effort:.0f}\n"
 
             return [TextContent(type="text", text=result)]
 
